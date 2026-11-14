@@ -27,6 +27,110 @@ function checked(result) {
   return result.data;
 }
 
+const bucket = () => db.storage.from('journal-photos');
+let draftPhotos = [];
+let processingPhotos = false;
+const imageUrls = new Map();
+
+function clearImageUrls() {
+  for (const url of imageUrls.keys()) URL.revokeObjectURL(url);
+  imageUrls.clear();
+}
+
+function releaseRemovedImages() {
+  for (const [url, image] of imageUrls) {
+    if (image.isConnected) continue;
+    URL.revokeObjectURL(url);
+    imageUrls.delete(url);
+  }
+}
+
+async function showPhoto(container, photo) {
+  const img = document.createElement('img');
+  img.alt = 'Journal photograph';
+  container.append(img);
+  try {
+    const blob = photo.blob || checked(await bucket().download(photo.object_path));
+    if (!img.isConnected) return;
+    const url = URL.createObjectURL(blob);
+    imageUrls.set(url, img);
+    img.src = url;
+  } catch {
+    if (img.isConnected) img.replaceWith('Photograph unavailable');
+  }
+}
+
+function renderDraftPhotos() {
+  $('#pending').replaceChildren();
+  draftPhotos.forEach((photo, index) => {
+    const preview = document.createElement('div');
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'action';
+    remove.textContent = 'Remove';
+    remove.onclick = () => {
+      if (busy || processingPhotos) return;
+      draftPhotos.splice(index, 1);
+      renderDraftPhotos();
+    };
+    $('#pending').append(preview);
+    void showPhoto(preview, photo);
+    preview.append(remove);
+  });
+}
+
+async function compressPhoto(file) {
+  const bitmap = await createImageBitmap(file);
+  const canvas = document.createElement('canvas');
+  const scale = Math.min(1, 1400 / Math.max(bitmap.width, bitmap.height));
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#fff';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.82));
+  if (!blob || blob.size > 5242880) throw new Error('invalid_photo');
+  return blob;
+}
+
+$('#photoInput').onchange = async event => {
+  const files = [...event.target.files];
+  event.target.value = '';
+  if (!journal || busy || processingPhotos) return;
+  if (files.length + draftPhotos.length > 8) {
+    status('Choose up to eight photographs per entry.');
+    return;
+  }
+  const scope = sessionVersion;
+  processingPhotos = true;
+  status('Preparing photographs…');
+  let failed = false;
+  try {
+    for (const file of files) {
+      try {
+        const blob = await compressPhoto(file);
+        if (scope !== sessionVersion) return;
+        draftPhotos.push({ id: crypto.randomUUID(), blob });
+      } catch { failed = true; }
+    }
+    renderDraftPhotos();
+    status(failed ? 'Some photographs could not be opened.' : 'Photographs ready to save.');
+  } finally { processingPhotos = false; }
+};
+
+async function uploadDraftPhotos(scope) {
+  for (const photo of draftPhotos) {
+    if (!photo.blob || photo.uploaded) continue;
+    if (scope !== sessionVersion) throw new Error('session_changed');
+    const path = journal + '/' + user + '/' + photo.id + '.jpg';
+    const result = await bucket().upload(path, photo.blob, { contentType: 'image/jpeg' });
+    if (result.error && String(result.error.statusCode) !== '409') checked(result);
+    photo.uploaded = true;
+  }
+}
+
 function renderEntries() {
   renderDate();
   const records = entries.filter(item => item.date === selected).sort((a, b) => a.created - b.created);
@@ -41,7 +145,21 @@ function renderEntries() {
       ${item.author_id === user ? '<button class="action" data-action="edit">Edit</button><button class="action" data-action="delete">Delete</button>' : ''}</div></div>
       <div class="bodytext ${item.writer === 'B' ? 'b' : 'a'}">${safe(item.text)}</div><div class="history" hidden></div></article>`;
   }).join('') || '<div class="empty"><strong>A page not yet filled.</strong>It can begin with something small.</div>';
-  records.forEach((item, index) => { $('#entries').children[index].dataset.entry = item.id; });
+  releaseRemovedImages();
+  records.forEach((item, index) => {
+    const card = $('#entries').children[index];
+    card.dataset.entry = item.id;
+    if (!item.photos.length) return;
+    const gallery = document.createElement('div');
+    gallery.className = 'photos';
+    card.append(gallery);
+    for (const photo of item.photos) {
+      const frame = document.createElement('figure');
+      frame.className = 'photo';
+      gallery.append(frame);
+      void showPhoto(frame, photo);
+    }
+  });
 }
 
 function selectDate(date) {
@@ -65,6 +183,8 @@ cancel.textContent = 'Cancel edit';
 $('.compose-bottom').append(cancel);
 function clearDraft() {
   edit = null;
+  draftPhotos = [];
+  renderDraftPhotos();
   $('#entryText').value = '';
   $('#writerHint').textContent = members.get(user)?.profiles?.display_name || '';
   cancel.hidden = true;
@@ -76,17 +196,17 @@ async function refresh() {
   const diary = journal, version = ++refreshVersion;
   const rows = [];
   for (let start = 0; ; start += 500) {
-    const page = checked(await db.from('entries').select('*').eq('journal_id', diary).order('id').range(start, start + 499));
+    const page = checked(await db.from('entries').select('*,entry_photos(id,object_path,position)').eq('journal_id', diary).order('id').range(start, start + 499));
     rows.push(...page);
     if (page.length < 500) break;
   }
   if (version !== refreshVersion || diary !== journal) return;
   entries = rows.map(row => ({
-    ...row, date: row.entry_date, created: Date.parse(row.created_at), text: row.body,
+    ...row, photos: [...row.entry_photos].sort((a, b) => a.position - b.position), date: row.entry_date, created: Date.parse(row.created_at), text: row.body,
     name: members.get(row.author_id)?.profiles?.display_name || 'Writer',
     writer: members.get(row.author_id)?.writer_slot || 'A'
   }));
-  if (!pinned && !edit && !$('#entryText').value.trim()) selected = iso(new Date());
+  if (!pinned && !edit && !draftPhotos.length && !processingPhotos && !$('#entryText').value.trim()) selected = iso(new Date());
   renderEntries();
   if ($('#view-calendar').classList.contains('active')) renderCalendar();
   if ($('#view-memories').classList.contains('active')) renderMemories();
@@ -96,14 +216,14 @@ async function write(params) {
   const signature = JSON.stringify(params);
   if (pending && pending.signature !== signature) {
     const previous = pending;
-    const result = await db.rpc('write_entry', previous.params);
+    const result = await db.rpc('write_photo_entry', previous.params);
     if (!result.error || result.error.code === 'P0001' || result.error.code === '42501') pending = null;
     checked(result);
     await refresh();
     throw new Error('previous_save_confirmed');
   }
   pending ||= { signature, params: { ...params, p_request: crypto.randomUUID() } };
-  const result = await db.rpc('write_entry', pending.params);
+  const result = await db.rpc('write_photo_entry', pending.params);
   if (!result.error || result.error.code === 'P0001' || result.error.code === '42501') pending = null;
   return checked(result);
 }
@@ -116,7 +236,7 @@ function feedback(problem) {
 
 async function saveEntry() {
   const body = $('#entryText').value.trim();
-  if (!journal || busy || !body) return;
+  if (!journal || busy || processingPhotos || (!body && !draftPhotos.length)) return;
   const scope = sessionVersion;
   busy = true;
   $('#entryText').disabled = true;
@@ -125,6 +245,9 @@ async function saveEntry() {
     const params = edit
       ? { p_journal: journal, p_action: 'edit', p_body: body, p_entry: edit.id, p_revision: edit.revision }
       : { p_journal: journal, p_action: 'create', p_body: body, p_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, p_date: pinned ? selected : null, p_expected_date: selected };
+    await uploadDraftPhotos(scope);
+    if (scope !== sessionVersion) return;
+    params.p_photos = draftPhotos.map(photo => photo.id);
     let receipt;
     try { receipt = await write(params); }
     catch (problem) {
@@ -153,10 +276,12 @@ $('#entries').onclick = async event => {
   const button = event.target.closest('[data-action]');
   const card = button?.closest('[data-entry]');
   const item = entries.find(entry => entry.id === card?.dataset.entry);
-  if (!item || busy) return;
+  if (!item || busy || processingPhotos) return;
   if (button.dataset.action === 'edit') {
     if ($('#entryText').value.trim() && !confirm('Replace the current draft?')) return;
     edit = item;
+    draftPhotos = item.photos.slice();
+    renderDraftPhotos();
     $('#entryText').value = item.text;
     $('#writerHint').textContent = 'Editing · ' + label(item.date);
     cancel.hidden = false;
@@ -210,6 +335,7 @@ function subscribeToDiary() {
 }
 
 function hideArchive() {
+  clearImageUrls();
   clearTimeout(refreshTimer);
   refreshTimer = null;
   const previousChannel = channel;
@@ -325,5 +451,7 @@ if (db) {
 } else {
   authStatus('Could not load the sign-in service. Check your connection and reload.');
 }
+
+
 
 
