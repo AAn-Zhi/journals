@@ -185,7 +185,36 @@ $('#entries').onclick = async event => {
   }
 };
 
+let channel, refreshTimer;
+
+function queueRealtimeRefresh() {
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    refresh().catch(() => toast('Could not sync your diary. It will retry when you return to this page.'));
+  }, 200);
+}
+
+function subscribeToDiary() {
+  const active = db.channel('journal:' + journal, { config: { private: true } });
+  channel = active;
+  active.on('broadcast', { event: 'entries_changed' }, () => {
+    if (channel === active) queueRealtimeRefresh();
+  }).subscribe(state => {
+    if (channel !== active) return;
+    if (state === 'SUBSCRIBED') queueRealtimeRefresh();
+    if (state === 'CHANNEL_ERROR' || state === 'TIMED_OUT') {
+      toast('Live updates are unavailable. Return to this page to refresh.');
+    }
+  });
+}
+
 function hideArchive() {
+  clearTimeout(refreshTimer);
+  refreshTimer = null;
+  const previousChannel = channel;
+  channel = null;
+  if (previousChannel) void db.removeChannel(previousChannel);
   ++refreshVersion;
   journal = user = pending = null;
   entries = [];
@@ -231,6 +260,7 @@ async function openSession(session) {
     $('.layout').style.display = '';
     $('.top-actions').style.display = '';
     showView('today');
+    subscribeToDiary();
   } catch (problem) {
     if (scope !== sessionVersion) return;
     hideArchive();
@@ -295,4 +325,5 @@ if (db) {
 } else {
   authStatus('Could not load the sign-in service. Check your connection and reload.');
 }
+
 
