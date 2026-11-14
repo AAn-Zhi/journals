@@ -425,18 +425,60 @@ $('#logout').onclick = async () => {
   try { checked(await db.auth.signOut({ scope: 'local' })); }
   catch { toast('Could not sign out. Try again.'); }
 };
+function photoDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
 $('#export').onclick = async () => {
   const scope = sessionVersion;
+  const button = $('#export');
+  button.disabled = true;
   try {
     await refresh();
     if (!journal || scope !== sessionVersion) return;
-    const url = URL.createObjectURL(new Blob([JSON.stringify(entries, null, 2)], { type: 'application/json' }));
+    const archive = [];
+    for (const entry of entries.slice()) {
+      if (scope !== sessionVersion) return;
+      const versions = [];
+      for (let start = 0; ; start += 500) {
+        const page = checked(await db.from('entry_versions').select('*')
+          .eq('entry_id', entry.id).order('revision').range(start, start + 499));
+        versions.push(...page);
+        if (page.length < 500) break;
+      }
+      const photos = [];
+      for (const photo of entry.photos) {
+        if (scope !== sessionVersion) return;
+        const blob = checked(await bucket().download(photo.object_path));
+        photos.push({ ...photo, data_url: await photoDataUrl(blob) });
+      }
+      archive.push({
+        id: entry.id, author_id: entry.author_id, author_name: entry.name,
+        writer_slot: entry.writer, body: entry.body, entry_date: entry.entry_date,
+        author_timezone: entry.author_timezone, author_utc_offset_minutes: entry.author_utc_offset_minutes,
+        created_at: entry.created_at, updated_at: entry.updated_at, revision: entry.revision,
+        versions, photos
+      });
+    }
+    if (scope !== sessionVersion) return;
+    const backup = { format: 'journals-backup', version: 1, exported_at: new Date().toISOString(), entries: archive };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'journals-archive.json';
+    link.download = 'journals-backup-' + iso(new Date()) + '.json';
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-  } catch { toast('Could not export the archive.'); }
+    toast('Journal backup downloaded.');
+  } catch {
+    if (scope === sessionVersion) toast('Backup could not be completed. Please retry.');
+  } finally {
+    button.disabled = false;
+  }
 };
 for (const event of ['focus', 'online']) {
   window.addEventListener(event, () => refresh().catch(() => toast('Could not refresh your diary.')));
@@ -451,6 +493,7 @@ if (db) {
 } else {
   authStatus('Could not load the sign-in service. Check your connection and reload.');
 }
+
 
 
 
